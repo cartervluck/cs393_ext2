@@ -144,6 +144,33 @@ impl fmt::Debug for Inode<> {
     }
 }
 
+fn parse_path(from: &str) -> Vec<&str> {
+    from.split('/')
+        .collect()
+}
+
+fn relative_directory<'a>(path: &'a str, from: Vec<(usize, &'a NulStr)>, fs: &'a Ext2) -> std::result::Result<Vec<(usize, &'a NulStr)>, &'static str> {
+    let mut target: Vec<(usize, &NulStr)> = (from).to_vec();
+    for child in parse_path(path).iter() {
+        let mut found = false;
+        for (addr, name) in target.iter() {
+            let name_u8 = (*(*name).as_bytes()).iter(); // this is a little nasty, but we compare iterators over the utf8 representation of the names
+            if name_u8.eq(child.as_bytes().iter()) {
+                target = match fs.read_dir_inode(*addr) { // if we find a matching child, set target to that and iterate
+                    Ok(dir_listing) => dir_listing,
+                    Err(_) => { println!("unable to read cwd"); break; } // dir has child, but child cannot be read
+                };
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err("No directory found with that path.");
+        }
+    }
+    Ok(target)
+}
+
 fn main() -> Result<()> {
     let disk = include_bytes!("../myfs.ext2");
     let start_addr: usize = disk.as_ptr() as usize;
@@ -169,7 +196,15 @@ fn main() -> Result<()> {
             if line.starts_with("ls") {
                 // `ls` prints our cwd's children
                 // TODO: support arguments to ls (print that directory's children instead)
-                for dir in &dirs {
+                let mut target = dirs;
+                let args = line.split(' ').collect::<Vec<&str>>();
+                if args.len() > 1 {
+                    target = match relative_directory(args[1],target.clone(),&ext2) {
+                        Ok(t) => t,
+                        Err(_) => target,
+                    };
+                }
+                for dir in &target {
                     print!("{}\t", dir.1);
                 }
                 println!();    
@@ -180,20 +215,22 @@ fn main() -> Result<()> {
                 if elts.len() == 1 {
                     current_working_inode = 2;
                 } else {
-                    // TODO: if the argument is a path, follow the path
-                    // e.g., cd dir_1/dir_2 should move you down 2 directories
-                    // deeper into dir_2
-                    let to_dir = elts[1];
-                    let mut found = false;
-                    for dir in &dirs {
-                        if dir.1.to_string().eq(to_dir) {
-                            // TODO: maybe don't just assume this is a directory
-                            found = true;
-                            current_working_inode = dir.0;
-                        }
+                    // TODO: Check if target location is actually a directory
+                    let mut target = match relative_directory(elts[1],dirs.clone(),&ext2) {
+                        Ok(t) => t,
+                        Err(_) => { println!("unable to locate {}, cwd unchanged", elts[1]); dirs },
+                    };
+                    let mut found_self = false;
+                    let mut which_inode = 2;
+                    for (addr, name) in target {
+                      if (*(*name).as_bytes()).iter().eq(".".as_bytes().iter()) {
+                        found_self = true;
+                        which_inode = addr;
+                        break;
+                      }
                     }
-                    if !found {
-                        println!("unable to locate {}, cwd unchanged", to_dir);
+                    if found_self { // otherwise, probably not a directory
+                      current_working_inode = which_inode;
                     }
                 }
             } else if line.starts_with("mkdir") {
