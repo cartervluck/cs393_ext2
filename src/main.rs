@@ -226,7 +226,13 @@ fn main() -> Result<()> {
                         Err(_) => { println!("unable to locate {}, cwd unchanged", elts[1]); current_working_inode },
                     };
                     if found_self { 
-                      current_working_inode = target;
+                        let inode: &Inode = ext2.get_inode(target);
+                        // check if directory flag is set (& DIRECTORY masks out other flags, == DIRECTORY compares flag)
+                        if inode.type_perm & structs::TypePerm::DIRECTORY == structs::TypePerm::DIRECTORY{
+                            current_working_inode = target;
+                        } else {
+                            println!("Destination is not a directory, cwd unchanged.");
+                        }
                     }
                 }
             } else if line.starts_with("mkdir") {
