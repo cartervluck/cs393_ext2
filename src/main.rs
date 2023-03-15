@@ -149,7 +149,7 @@ fn parse_path(from: &str) -> Vec<&str> {
         .collect()
 }
 
-fn relative_directory<'a>(path: &'a str, from: Vec<(usize, &'a NulStr)>, fs: &'a Ext2) -> std::result::Result<usize, &'a str> {
+fn relative_path<'a>(path: &'a str, from: Vec<(usize, &'a NulStr)>, fs: &'a Ext2) -> std::result::Result<usize, &'a str> {
     let mut target: Vec<(usize, &NulStr)> = (from).to_vec();
     let mut target_inode: usize = 2;
     let mut temp: Vec<(usize, &NulStr)> = target.clone();
@@ -167,7 +167,7 @@ fn relative_directory<'a>(path: &'a str, from: Vec<(usize, &'a NulStr)>, fs: &'a
             }
         }
         if !found {
-            return Err("No directory found with that path.");
+            return Err("No file or directory found with that path.");
         } else {
             target = temp.clone();
         }
@@ -203,7 +203,7 @@ fn main() -> Result<()> {
                 let mut target = dirs;
                 let args = line.split(' ').collect::<Vec<&str>>();
                 if args.len() > 1 {
-                    target = match relative_directory(args[1],target.clone(),&ext2) {
+                    target = match relative_path(args[1],target.clone(),&ext2) {
                         Ok(t) => match ext2.read_dir_inode(t) { Ok(d) => d, Err(_) => target },
                         Err(_) => target,
                     };
@@ -219,9 +219,8 @@ fn main() -> Result<()> {
                 if elts.len() == 1 {
                     current_working_inode = 2;
                 } else {
-                    // TODO: Check if target location is actually a directory
                     let mut found_self = false;
-                    let mut target = match relative_directory(elts[1],dirs.clone(),&ext2) {
+                    let mut target = match relative_path(elts[1],dirs.clone(),&ext2) {
                         Ok(t) => { found_self = true; t },
                         Err(_) => { println!("unable to locate {}, cwd unchanged", elts[1]); current_working_inode },
                     };
