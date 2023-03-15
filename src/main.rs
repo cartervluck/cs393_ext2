@@ -220,7 +220,7 @@ fn main() -> Result<()> {
                     current_working_inode = 2;
                 } else {
                     let mut found_self = false;
-                    let mut target = match relative_path(elts[1],dirs.clone(),&ext2) {
+                    let target = match relative_path(elts[1],dirs.clone(),&ext2) {
                         Ok(t) => { found_self = true; t },
                         Err(_) => { println!("unable to locate {}, cwd unchanged", elts[1]); current_working_inode },
                     };
