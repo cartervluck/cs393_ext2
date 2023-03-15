@@ -127,6 +127,21 @@ impl Ext2 {
         } 
         Ok(ret)
     }
+
+    pub fn read_dir_block(&self, block: usize) -> std::io::Result<Vec<&u8>> {
+        let size: isize = 1 << (self.superblock.log_block_size + 10);
+        let entry_ptr = self.blocks[block - self.block_offset].as_ptr();
+        let mut byte_offset: isize = 0;
+        let mut ret = Vec::new();
+        while byte_offset < size {
+          let dat = unsafe {
+            &*(entry_ptr.offset(byte_offset) as *const u8)
+          };
+          byte_offset += 1;
+          ret.push(dat);
+        }
+        Ok(ret)
+    }
 }
 
 impl fmt::Debug for Inode<> {
@@ -243,7 +258,40 @@ fn main() -> Result<()> {
                 // `cat filename`
                 // print the contents of filename to stdout
                 // if it's a directory, print a nice error
-                println!("cat not yet implemented");
+                let elts: Vec<&str> = line.split(' ').collect();
+                if elts.len() == 1 {
+                    println!("Command `cat` expected one argument, no arguments given.");
+                } else {
+                    let mut found_file = false;
+                    let target = match relative_path(elts[1],dirs.clone(),&ext2) {
+                        Ok(t) => { found_file = true; t },
+                        Err(_) => { println!("unable to locate {}, cwd unchanged", elts[1]); current_working_inode },
+                    };
+                    if found_file { 
+                        let inode: &Inode = ext2.get_inode(target);
+                        // check if directory flag is set (& DIRECTORY masks out other flags, == DIRECTORY compares flag)
+                        if inode.type_perm & structs::TypePerm::FILE == structs::TypePerm::FILE {
+                            let mut current_size: usize = 0;
+                            for direct in inode.direct_pointer {
+                              let block = ext2.read_dir_block(direct as usize);
+                              match block {
+                                Ok(b) => {
+                                  for c in b {
+                                    print!("{}", *c as char);
+                                  }
+                                },
+                                Err(e) => println!("{}",e),
+                              }
+                              current_size += 1 << (ext2.superblock.log_block_size + 10);
+                              if current_size > inode.size_low.try_into().unwrap() {
+                                break
+                              }
+                            }
+                        } else {
+                            println!("Destination is not a file.");
+                        }
+                    }
+                }
             } else if line.starts_with("rm") {
                 // `rm target`
                 // unlink a file or empty directory
