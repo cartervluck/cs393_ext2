@@ -273,19 +273,19 @@ fn main() -> Result<()> {
                         if inode.type_perm & structs::TypePerm::FILE == structs::TypePerm::FILE {
                             let mut current_size: usize = 0;
                             for direct in inode.direct_pointer {
-                              let block = ext2.read_dir_block(direct as usize);
-                              match block {
-                                Ok(b) => {
-                                  for c in b {
-                                    print!("{}", *c as char);
-                                  }
-                                },
-                                Err(e) => println!("{}",e),
-                              }
-                              current_size += 1 << (ext2.superblock.log_block_size + 10);
-                              if current_size > inode.size_low.try_into().unwrap() {
-                                break
-                              }
+                                if current_size >= inode.size_low.try_into().unwrap() {
+                                    break
+                                }
+                                let block = ext2.read_dir_block(direct as usize);
+                                match block {
+                                    Ok(b) => {
+                                        for c in b {
+                                            print!("{}", *c as char);
+                                        }
+                                    },
+                                    Err(e) => println!("{}",e),
+                                }
+                                current_size += 1 << (ext2.superblock.log_block_size + 10);
                             }
                         } else {
                             println!("Destination is not a file.");
