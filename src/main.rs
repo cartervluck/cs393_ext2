@@ -1,21 +1,25 @@
 #![feature(int_roundings)]
 
 mod structs;
-use crate::structs::{BlockGroupDescriptor, DirectoryEntry, Inode, Superblock};
+use crate::structs::{BlockGroupDescriptor, DirectoryEntry, Inode, Superblock, TypeIndicator};
 use std::mem;
 use null_terminated::NulStr;
 use uuid::Uuid;
 use zerocopy::ByteSlice;
 use std::fmt;
 use rustyline::{DefaultEditor, Result};
+use std::fs;
+use std::env::args;
 
 #[repr(C)]
 #[derive(Debug)]
 pub struct Ext2 {
+    pub start_ptr: &'static [u8],
     pub superblock: &'static Superblock,
-    pub block_groups: &'static [BlockGroupDescriptor],
+    pub block_groups: &'static mut [BlockGroupDescriptor],
     pub blocks: Vec<&'static [u8]>,
     pub block_size: usize,
+    pub total_size: usize,
     pub uuid: Uuid,
     pub block_offset: usize, // <- our "device data" actually starts at this index'th block of the device
                              // so we have to subtract this number before indexing blocks[]
@@ -26,19 +30,19 @@ const EXT2_START_OF_SUPERBLOCK: usize = 1024;
 const EXT2_END_OF_SUPERBLOCK: usize = 2048;
 
 impl Ext2 {
-    pub fn new<B: ByteSlice + std::fmt::Debug>(device_bytes: B, start_addr: usize) -> Ext2 {
+    pub fn new<B: ByteSlice + std::fmt::Debug + std::ops::DerefMut>(device_bytes: &mut B, start_addr: usize) -> Ext2 {
         // https://wiki.osdev.org/Ext2#Superblock
         // parse into Ext2 struct - without copying
 
         // the superblock goes from bytes 1024 -> 2047
-        let header_body_bytes = device_bytes.split_at(EXT2_END_OF_SUPERBLOCK);
+        let mut header_body_bytes = (*device_bytes).split_at_mut(EXT2_END_OF_SUPERBLOCK);
 
+        let mut header_parts = header_body_bytes.0.split_at_mut(EXT2_START_OF_SUPERBLOCK);
+  
         let superblock = unsafe {
-            &*(header_body_bytes
-                .0
-                .split_at(EXT2_START_OF_SUPERBLOCK)
+            &*(header_parts
                 .1
-                .as_ptr() as *const Superblock)
+                .as_ptr() as *mut Superblock)
         };
         assert_eq!(superblock.magic, EXT2_MAGIC);
         // at this point, we strongly suspect these bytes are indeed an ext2 filesystem
@@ -58,8 +62,8 @@ impl Ext2 {
         let block_groups_rest_bytes = header_body_bytes.1.split_at(block_size);
 
         let block_groups = unsafe {
-            std::slice::from_raw_parts(
-                block_groups_rest_bytes.0.as_ptr() as *const BlockGroupDescriptor,
+            std::slice::from_raw_parts_mut(
+                block_groups_rest_bytes.0.as_ptr() as *mut BlockGroupDescriptor,
                 block_group_count,
             )
         };
@@ -68,7 +72,7 @@ impl Ext2 {
 
         let blocks = unsafe {
             std::slice::from_raw_parts(
-                block_groups_rest_bytes.1.as_ptr() as *const u8,
+                block_groups_rest_bytes.1.as_ptr() as *mut u8,
                 // would rather use: device_bytes.as_ptr(),
                 superblock.blocks_count as usize * block_size,
             )
@@ -79,35 +83,42 @@ impl Ext2 {
         let offset_bytes = (blocks[0].as_ptr() as usize) - start_addr;
         let block_offset = offset_bytes / block_size;
         let uuid = Uuid::from_bytes(superblock.fs_id);
+        
+        let total_size = (superblock.blocks_count as usize) * block_size;
+        println!("The total size of the file system is {} bytes", total_size);
+        let start_ptr = unsafe { std::slice::from_raw_parts_mut(header_parts.0.as_mut_ptr(), total_size) };
+
         Ext2 {
+            start_ptr,
             superblock,
             block_groups,
             blocks,
             block_size,
+            total_size,
             uuid,
             block_offset,
         }
     }
 
     // given a (1-indexed) inode number, return that #'s inode structure
-    pub fn get_inode(&self, inode: usize) -> &Inode {
+    pub fn get_inode(&self, inode: usize) -> &mut Inode {
         let group: usize = (inode - 1) / self.superblock.inodes_per_group as usize;
         let index: usize = (inode - 1) % self.superblock.inodes_per_group as usize;
 
-        // println!("in get_inode, inode num = {}, index = {}, group = {}", inode, index, group);
+        //println!("in get_inode, inode num = {}, index = {}, group = {}", inode, index, group);
         let inode_table_block = (self.block_groups[group].inode_table_block) as usize - self.block_offset;
         // println!("in get_inode, block number of inode table {}", inode_table_block);
-        let inode_table = unsafe {
-            std::slice::from_raw_parts(
+        let inode_table: &mut [Inode] = unsafe {
+            std::slice::from_raw_parts_mut(
                 self.blocks[inode_table_block].as_ptr()
-                    as *const Inode,
+                    as *mut Inode,
                 self.superblock.inodes_per_group as usize,
             )
         };
         // probably want a Vec of BlockGroups in our Ext structure so we don't have to slice each time,
         // but this works for now.
         // println!("{:?}", inode_table);
-        &inode_table[index]
+        &mut inode_table[index]
     }
 
     pub fn read_dir_inode(&self, inode: usize) -> std::io::Result<Vec<(usize, &NulStr)>> {
@@ -128,19 +139,91 @@ impl Ext2 {
         Ok(ret)
     }
 
-    pub fn read_dir_block(&self, block: usize) -> std::io::Result<Vec<&u8>> {
+    pub fn read_dir_block(&self, block: usize) -> std::io::Result<&mut [u8]> {
         let size: isize = 1 << (self.superblock.log_block_size + 10);
         let entry_ptr = self.blocks[block - self.block_offset].as_ptr();
-        let mut byte_offset: isize = 0;
+        /*let mut byte_offset: isize = 0;
         let mut ret = Vec::new();
         while byte_offset < size {
           let dat = unsafe {
-            &*(entry_ptr.offset(byte_offset) as *const u8)
+            *(entry_ptr.offset(byte_offset) as *mut u8)
           };
           byte_offset += 1;
           ret.push(dat);
+        }*/
+        unsafe { Ok(std::slice::from_raw_parts_mut(
+            entry_ptr as *mut u8,
+            1024 << self.superblock.log_block_size,
+        )) }
+    }
+
+    pub fn allocate_block(&mut self) -> usize {
+        let mut group = 0;
+        for g in 0..self.block_groups.len() {
+            if self.block_groups[g].free_blocks_count > 0 {
+              group = g;
+              break
+            }
         }
-        Ok(ret)
+        let mut block_bitmap: &mut [u8] = self.read_dir_block(usize::try_from(self.block_groups[group].block_usage_addr).unwrap()).unwrap();
+        let mut block_number = 0;
+        for i in 1..=self.superblock.inodes_per_group {
+            //println!("Block bitmap: {}", block_bitmap[usize::try_from(i).unwrap()]);
+            let which_byte = usize::try_from(i % 8).unwrap();
+            let which_bit = usize::try_from(i / 8).unwrap();
+            //println!("Block bitmap & which_bit: {}", block_bitmap[usize::try_from(i).unwrap()]);
+            if block_bitmap[which_byte] & (2 << which_bit) == 0 {
+                block_number = i;
+                block_bitmap[which_byte] = block_bitmap[which_byte] | (2 << which_bit);
+                break
+            }
+        }
+        println!("Allocated block {}", group * (self.superblock.blocks_per_group as usize) + (block_number as usize));
+        group * (self.superblock.blocks_per_group as usize) + (block_number as usize) 
+    }
+
+    pub fn link(&self, dir_inode: usize, link_inode: usize, name: String) -> Result<()> {
+        let directory = self.get_inode(dir_inode);
+        println!("Linking, my direct pointer is {}", directory.direct_pointer[0]);
+        let entry_ptr = self.blocks[directory.direct_pointer[0] as usize - self.block_offset].as_ptr();
+        let mut byte_offset: isize = 0;
+        while byte_offset < directory.size_low as isize { // <- todo, support large directories
+            let new_directory = unsafe {
+                &mut *(entry_ptr.offset(byte_offset) as *mut DirectoryEntry) 
+            };
+            //println!("{:?}", new_directory);
+            
+            if new_directory.entry_size == 0 {
+              break;
+            }
+
+            if new_directory.entry_size as isize + byte_offset >= directory.size_low as isize {
+                let real_size = u16::try_from(4 + 2 + 1 + mem::size_of::<TypeIndicator>() + new_directory.name.as_bytes().len() + 1).unwrap();
+                // inode ptr size + entry size size + name size size + type indicator size + name size + null character
+                new_directory.entry_size = real_size;
+                byte_offset += real_size as isize;
+                break;
+            }
+            byte_offset += new_directory.entry_size as isize;
+        }
+        let new_directory = unsafe {
+            &mut *(entry_ptr.offset(byte_offset) as *mut DirectoryEntry)
+        };
+        //println!("{:?}",new_directory);
+        new_directory.inode = u32::try_from(link_inode).unwrap();
+        println!("Linking from inode {} to inode {}", dir_inode, new_directory.inode);
+        new_directory.name_length = u8::try_from(name.len()).unwrap();
+        new_directory.type_indicator = TypeIndicator::Directory;
+        let mut name_iter = new_directory.name.as_bytes_mut().as_mut_ptr();
+        let mut name_offset = 0;
+        for c in name.as_bytes() {
+            unsafe { *name_iter.offset(name_offset) = *c; } 
+            name_offset += 1;
+        }
+        unsafe { *name_iter.offset(name_offset) = 0; }
+        // inode ptr size + entry size size + name size size + type indicator size + name size + null character
+        new_directory.entry_size = u16::try_from(directory.size_low).unwrap() - u16::try_from(byte_offset).unwrap();
+        Ok(())
     }
 }
 
@@ -190,10 +273,16 @@ fn relative_path<'a>(path: &'a str, from: Vec<(usize, &'a NulStr)>, fs: &'a Ext2
     Ok(target_inode)
 }
 
+fn flush(fs: &Ext2, name: String) {
+    fs::write(name, fs.start_ptr).unwrap();
+}
+
 fn main() -> Result<()> {
-    let disk = include_bytes!("../myfs.ext2");
+    let fname = args().nth(1).expect("No file given");
+    let disk = &mut fs::read(fname.clone()).expect("No such file exists");
     let start_addr: usize = disk.as_ptr() as usize;
-    let ext2 = Ext2::new(&disk[..], start_addr);
+    let mut disk_slice: &mut [u8] = &mut disk[..];
+    let mut ext2 = Ext2::new(&mut disk_slice, start_addr);
 
     let mut current_working_inode:usize = 2;
 
@@ -226,7 +315,7 @@ fn main() -> Result<()> {
                 for dir in &target {
                     print!("{}\t", dir.1);
                 }
-                println!();    
+                println!();
             } else if line.starts_with("cd") {
                 // `cd` with no arguments, cd goes back to root
                 // `cd dir_name` moves cwd to that directory
@@ -244,6 +333,7 @@ fn main() -> Result<()> {
                         // check if directory flag is set (& DIRECTORY masks out other flags, == DIRECTORY compares flag)
                         if inode.type_perm & structs::TypePerm::DIRECTORY == structs::TypePerm::DIRECTORY{
                             current_working_inode = target;
+                            println!("cwd is now {}", target);
                         } else {
                             println!("Destination is not a directory, cwd unchanged.");
                         }
@@ -253,7 +343,68 @@ fn main() -> Result<()> {
                 // `mkdir childname`
                 // create a directory with the given name, add a link to cwd
                 // consider supporting `-p path/to_file` to create a path of directories
-                println!("mkdir not yet implemented");
+                let args = line.split(' ').collect::<Vec<&str>>();
+                if args.len() <= 1 {
+                    println!("No name given, mkdir failed");
+                    continue
+                }
+                if ext2.superblock.free_inodes_count <= 0 {
+                    println!("File system full, mkdir failed");
+                    continue
+                }
+
+                let mut cwd = 0;
+                for dir in dirs {
+                  if dir.1.to_string().eq(".") {
+                    cwd = dir.0;
+                    break
+                  }
+                }
+                if cwd == 0 {
+                  continue
+                }
+                let name = args[1];
+
+                let mut group_i = 0;
+                for group_i in 0..ext2.block_groups.len() {
+                    if ext2.block_groups[group_i].free_inodes_count > 0 {
+                        break;
+                    }
+                };
+                
+                let group = &mut ext2.block_groups[group_i];
+
+                group.free_inodes_count -= 1;
+                group.dirs_count += 1;
+
+                let inode_bitmap_addr = usize::try_from(group.inode_usage_addr).unwrap();
+
+                let allocated_block = ext2.allocate_block();
+  
+                let mut inode_bitmap = ext2.read_dir_block(inode_bitmap_addr).unwrap();
+                let mut inode_number = 0;
+                for i in 1..ext2.superblock.inodes_per_group {
+                    let which_byte = usize::try_from(i % 8).unwrap();
+                    let which_bit = usize::try_from(i / 8).unwrap();
+                    if !inode_bitmap[which_byte] ^ (2 << which_bit) > 0 {
+                        inode_number = i;
+                        inode_bitmap[which_byte] = inode_bitmap[which_byte] | (2 << which_bit);
+                        break
+                    }
+                }
+                if inode_number == 0 {
+                  println!("Problem finding inode, mkdir failed");
+                  continue
+                }
+                let inode_number = u32::try_from(group_i).unwrap() * ext2.superblock.inodes_per_group + inode_number;
+                let inode: &mut Inode = ext2.get_inode(inode_number.try_into().unwrap());
+                inode.type_perm = structs::TypePerm::DIRECTORY | structs::TypePerm::U_READ;
+                inode.size_low = 1024 << ext2.superblock.log_block_size;
+                inode.hard_links = 1;
+                inode.direct_pointer[0] = allocated_block as u32;
+                ext2.link(cwd, inode_number.try_into().unwrap(), name.to_string());
+                ext2.link(inode_number.try_into().unwrap(), inode_number.try_into().unwrap(), ".".to_string());
+                ext2.link(inode_number.try_into().unwrap(), cwd.try_into().unwrap(), "..".to_string());
             } else if line.starts_with("cat") {
                 // `cat filename`
                 // print the contents of filename to stdout
@@ -296,6 +447,8 @@ fn main() -> Result<()> {
                 // `rm target`
                 // unlink a file or empty directory
                 println!("rm not yet implemented");
+            } else if line.starts_with("flush") {
+                flush(&ext2, fname.clone());
             } else if line.starts_with("mount") {
                 // `mount host_filename mountpoint`
                 // mount an ext2 filesystem over an existing empty directory
