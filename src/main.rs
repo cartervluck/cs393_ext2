@@ -178,8 +178,18 @@ impl Ext2 {
                 break
             }
         }
-        println!("Allocated block {}", group * (self.superblock.blocks_per_group as usize) + (block_number as usize));
-        group * (self.superblock.blocks_per_group as usize) + (block_number as usize) 
+
+        let final_block = group * (self.superblock.blocks_per_group as usize) + (block_number as usize);
+
+        println!("Allocated block {}", final_block);
+        
+        // clean out old data
+        let mut block = self.read_dir_block(final_block).unwrap();
+        for i in 0..self.block_size {
+          block[i] = 0;
+        }
+        
+        final_block
     }
 
     pub fn link(&self, dir_inode: usize, link_inode: usize, name: String) -> Result<()> {
