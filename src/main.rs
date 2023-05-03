@@ -348,10 +348,25 @@ fn main() -> Result<()> {
                     println!("No name given, mkdir failed");
                     continue
                 }
+                
+                let (path, name) = match args[1].rsplit_once("/") {
+                  Some(o) => o,
+                  None => ("", args[1]),
+                };
+
                 if ext2.superblock.free_inodes_count <= 0 {
                     println!("File system full, mkdir failed");
                     continue
                 }
+                
+                let mut found_self = false;
+                let dirs = match path {
+                  "" => {found_self = true; dirs},
+                  _ => match relative_path(path, dirs.clone(), &ext2) {
+                      Ok(t) => {found_self = true; ext2.read_dir_inode(t).unwrap()}
+                      Err(_) => {println!("Unable to locate {}, mkdir failed", path); dirs }
+                  },
+                };
 
                 let mut cwd = 0;
                 for dir in dirs {
@@ -361,9 +376,14 @@ fn main() -> Result<()> {
                   }
                 }
                 if cwd == 0 {
+                  println!("Couldn't navigate, mkdir failed");
                   continue
                 }
-                let name = args[1];
+
+                if !found_self {
+                  println!("Error while navigating, mkdir failed");
+                  continue
+                }
 
                 let mut group_i = 0;
                 for group_i in 0..ext2.block_groups.len() {
