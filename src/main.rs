@@ -169,12 +169,12 @@ impl Ext2 {
         let mut block_number = 0;
         for i in 1..=self.superblock.inodes_per_group {
             //println!("Block bitmap: {}", block_bitmap[usize::try_from(i).unwrap()]);
-            let which_byte = usize::try_from(i % 8).unwrap();
-            let which_bit = usize::try_from(i / 8).unwrap();
+            let which_byte = usize::try_from(i / 8).unwrap();
+            let which_bit = usize::try_from(i % 8).unwrap();
             //println!("Block bitmap & which_bit: {}", block_bitmap[usize::try_from(i).unwrap()]);
-            if block_bitmap[which_byte] & (2 << which_bit) == 0 {
+            if block_bitmap[which_byte] & (1 << which_bit) == 0 {
                 block_number = i;
-                block_bitmap[which_byte] = block_bitmap[which_byte] | (2 << which_bit);
+                block_bitmap[which_byte] = block_bitmap[which_byte] | (1 << which_bit);
                 break
             }
         }
@@ -404,14 +404,17 @@ fn main() -> Result<()> {
                 let mut inode_bitmap = ext2.read_dir_block(inode_bitmap_addr).unwrap();
                 let mut inode_number = 0;
                 for i in 1..ext2.superblock.inodes_per_group {
-                    let which_byte = usize::try_from(i % 8).unwrap();
-                    let which_bit = usize::try_from(i / 8).unwrap();
-                    if !inode_bitmap[which_byte] ^ (2 << which_bit) > 0 {
+                    let which_byte = usize::try_from(i / 8).unwrap();
+                    let which_bit = usize::try_from(i % 8).unwrap();
+                    if !(inode_bitmap[which_byte] & (1 << which_bit) > 0) {
+                        println!("Bitmap before: {}", inode_bitmap[which_byte]);
                         inode_number = i;
-                        inode_bitmap[which_byte] = inode_bitmap[which_byte] | (2 << which_bit);
+                        inode_bitmap[which_byte] = inode_bitmap[which_byte] | (1 << which_bit);
                         break
                     }
                 }
+                let bm = ext2.read_dir_block(usize::try_from(ext2.block_groups[group_i].inode_usage_addr).unwrap()).unwrap();
+                println!("Allocated inode in group {}, bitmap looks like {}", group_i, bm[usize::try_from(inode_number / 8).unwrap()]);
                 if inode_number == 0 {
                   println!("Problem finding inode, mkdir failed");
                   continue
