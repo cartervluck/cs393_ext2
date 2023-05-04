@@ -157,6 +157,43 @@ impl Ext2 {
         )) }
     }
 
+    pub fn allocate_inode(&mut self) -> std::result::Result<usize, &str> {
+        let mut group_i = 0;
+        for group_i in 0..self.block_groups.len() {
+            if self.block_groups[group_i].free_inodes_count > 0 {
+                break;
+            }
+        };
+            
+        let group = &mut self.block_groups[group_i];
+
+        group.free_inodes_count -= 1;
+        group.dirs_count += 1;
+
+        let inode_bitmap_addr = usize::try_from(group.inode_usage_addr).unwrap();
+
+
+        let mut inode_bitmap = self.read_dir_block(inode_bitmap_addr).unwrap();
+        let mut inode_number = 0;
+        for i in 1..self.superblock.inodes_per_group {
+            let which_byte = usize::try_from(i / 8).unwrap();
+            let which_bit = usize::try_from(i % 8).unwrap();
+            if !(inode_bitmap[which_byte] & (1 << which_bit) > 0) {
+                println!("Bitmap before: {}", inode_bitmap[which_byte]);
+                inode_number = i;
+                inode_bitmap[which_byte] = inode_bitmap[which_byte] | (1 << which_bit);
+                break
+            }
+        }
+        let bm = self.read_dir_block(usize::try_from(self.block_groups[group_i].inode_usage_addr).unwrap()).unwrap();
+        println!("Allocated inode in group {}, bitmap looks like {}", group_i, bm[usize::try_from(inode_number / 8).unwrap()]);
+        if inode_number == 0 {
+            return Err("Error finding inode.")
+        }
+        let inode_number = u32::try_from(group_i).unwrap() * self.superblock.inodes_per_group + inode_number;
+        Ok(inode_number.try_into().unwrap())
+    }
+
     pub fn allocate_block(&mut self) -> usize {
         let mut group = 0;
         for g in 0..self.block_groups.len() {
@@ -364,7 +401,7 @@ fn main() -> Result<()> {
                   None => ("", args[1]),
                 };
 
-                if ext2.superblock.free_inodes_count <= 0 {
+                if ext2.superblock.free_inodes_count == 0 {
                     println!("File system full, mkdir failed");
                     continue
                 }
@@ -395,41 +432,8 @@ fn main() -> Result<()> {
                   continue
                 }
 
-                let mut group_i = 0;
-                for group_i in 0..ext2.block_groups.len() {
-                    if ext2.block_groups[group_i].free_inodes_count > 0 {
-                        break;
-                    }
-                };
-                
-                let group = &mut ext2.block_groups[group_i];
-
-                group.free_inodes_count -= 1;
-                group.dirs_count += 1;
-
-                let inode_bitmap_addr = usize::try_from(group.inode_usage_addr).unwrap();
-
                 let allocated_block = ext2.allocate_block();
-  
-                let mut inode_bitmap = ext2.read_dir_block(inode_bitmap_addr).unwrap();
-                let mut inode_number = 0;
-                for i in 1..ext2.superblock.inodes_per_group {
-                    let which_byte = usize::try_from(i / 8).unwrap();
-                    let which_bit = usize::try_from(i % 8).unwrap();
-                    if !(inode_bitmap[which_byte] & (1 << which_bit) > 0) {
-                        println!("Bitmap before: {}", inode_bitmap[which_byte]);
-                        inode_number = i;
-                        inode_bitmap[which_byte] = inode_bitmap[which_byte] | (1 << which_bit);
-                        break
-                    }
-                }
-                let bm = ext2.read_dir_block(usize::try_from(ext2.block_groups[group_i].inode_usage_addr).unwrap()).unwrap();
-                println!("Allocated inode in group {}, bitmap looks like {}", group_i, bm[usize::try_from(inode_number / 8).unwrap()]);
-                if inode_number == 0 {
-                  println!("Problem finding inode, mkdir failed");
-                  continue
-                }
-                let inode_number = u32::try_from(group_i).unwrap() * ext2.superblock.inodes_per_group + inode_number;
+                let inode_number = ext2.allocate_inode().unwrap();
                 let inode: &mut Inode = ext2.get_inode(inode_number.try_into().unwrap());
                 inode.type_perm = structs::TypePerm::DIRECTORY | structs::TypePerm::U_READ;
                 inode.size_low = 1024 << ext2.superblock.log_block_size;
