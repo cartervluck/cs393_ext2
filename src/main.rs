@@ -495,7 +495,35 @@ fn main() -> Result<()> {
                 // create a hard link from arg_1 to arg_2
                 // consider what to do if arg2 does- or does-not end in "/"
                 // and/or if arg2 is an existing directory name
-                println!("link not yet implemented");
+                let args = line.split(' ').collect::<Vec<&str>>();
+                if args.len() == 1 {
+                  println!("Command `link` expected two arguments, no arguments given.");
+                } else if args.len() == 2 {
+                  println!("Command `link` expected two arguments, one argument given.");
+                }
+                
+                let source = args[1];
+                let mut found_self = false;
+                let source_inode = match relative_path(source, dirs.clone(), &ext2) {
+                    Ok(t) => {found_self = true; t},
+                    Err(_) => {println!("Unable to locate {}, mkdir failed", source); 0 },
+                };
+
+
+                let (dest_path, dest_name) = match args[2].rsplit_once("/") {
+                  Some(o) => o,
+                  None => ("", args[2]),
+                };
+                let mut found_self = false;
+                let dest_dir_inode = match dest_path {
+                  "" => {found_self = true; let mut t = 0; for (num, name) in dirs { if name.to_string().eq(".") { t = num; break } }; t },
+                  _ => match relative_path(dest_path, dirs.clone(), &ext2) {
+                      Ok(t) => {found_self = true; t},
+                      Err(_) => {println!("Unable to locate {}, mkdir failed", dest_path); 0 },
+                  },
+                };
+
+                ext2.link(dest_dir_inode, source_inode, dest_name.to_string());
             } else if line.starts_with("quit") || line.starts_with("exit") {
                 break;
             }
