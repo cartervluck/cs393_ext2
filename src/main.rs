@@ -121,6 +121,7 @@ impl Ext2 {
         &mut inode_table[index]
     }
 
+    // given an inode number, parse that inode as a directory and return directory contents
     pub fn read_dir_inode(&self, inode: usize) -> std::io::Result<Vec<(usize, &NulStr)>> {
         let mut ret = Vec::new();
         let root = self.get_inode(inode);
@@ -139,24 +140,17 @@ impl Ext2 {
         Ok(ret)
     }
 
+    // given a block number, read the contents of that block as an array of bytes
     pub fn read_dir_block(&self, block: usize) -> std::io::Result<&mut [u8]> {
         let size: isize = 1 << (self.superblock.log_block_size + 10);
         let entry_ptr = self.blocks[block - self.block_offset].as_ptr();
-        /*let mut byte_offset: isize = 0;
-        let mut ret = Vec::new();
-        while byte_offset < size {
-          let dat = unsafe {
-            *(entry_ptr.offset(byte_offset) as *mut u8)
-          };
-          byte_offset += 1;
-          ret.push(dat);
-        }*/
         unsafe { Ok(std::slice::from_raw_parts_mut(
             entry_ptr as *mut u8,
             1024 << self.superblock.log_block_size,
         )) }
     }
 
+    // find free inode and allocate it for use, specifically for a directory
     pub fn allocate_inode(&mut self) -> std::result::Result<usize, &str> {
         let mut group_i = 0;
         for group_i in 0..self.block_groups.len() {
@@ -164,11 +158,11 @@ impl Ext2 {
                 break;
             }
         };
-            
+        
         let group = &mut self.block_groups[group_i];
 
         group.free_inodes_count -= 1;
-        group.dirs_count += 1;
+        group.dirs_count += 1; // this only applies to directories
 
         let inode_bitmap_addr = usize::try_from(group.inode_usage_addr).unwrap();
 
@@ -178,6 +172,7 @@ impl Ext2 {
         for i in 1..self.superblock.inodes_per_group {
             let which_byte = usize::try_from(i / 8).unwrap();
             let which_bit = usize::try_from(i % 8).unwrap();
+            // Check if relevant bit is 1 or 0 by ANDing with 1 << which_bit
             if !(inode_bitmap[which_byte] & (1 << which_bit) > 0) {
                 println!("Bitmap before: {}", inode_bitmap[which_byte]);
                 inode_number = i;
@@ -190,10 +185,12 @@ impl Ext2 {
         if inode_number == 0 {
             return Err("Error finding inode.")
         }
+        // Recontextualize inode number from within group to global number
         let inode_number = u32::try_from(group_i).unwrap() * self.superblock.inodes_per_group + inode_number;
         Ok(inode_number.try_into().unwrap())
     }
 
+    // find free block and allocate it for use
     pub fn allocate_block(&mut self) -> usize {
         let mut group = 0;
         for g in 0..self.block_groups.len() {
@@ -202,6 +199,7 @@ impl Ext2 {
               break
             }
         }
+
         let mut block_bitmap: &mut [u8] = self.read_dir_block(usize::try_from(self.block_groups[group].block_usage_addr).unwrap()).unwrap();
         let mut block_number = 0;
         for i in 1..=self.superblock.inodes_per_group {
@@ -209,6 +207,7 @@ impl Ext2 {
             let which_byte = usize::try_from(i / 8).unwrap();
             let which_bit = usize::try_from(i % 8).unwrap();
             //println!("Block bitmap & which_bit: {}", block_bitmap[usize::try_from(i).unwrap()]);
+            // If the bit is free (0 is free, 1 is in use)
             if block_bitmap[which_byte] & (1 << which_bit) == 0 {
                 block_number = i;
                 block_bitmap[which_byte] = block_bitmap[which_byte] | (1 << which_bit);
@@ -229,6 +228,7 @@ impl Ext2 {
         final_block
     }
 
+    // create a hardlink from a directory to an inode
     pub fn link(&self, dir_inode: usize, link_inode: usize, name: String) -> Result<()> {
         let directory = self.get_inode(dir_inode);
         println!("Linking, my direct pointer is {}", directory.direct_pointer[0]);
@@ -244,6 +244,7 @@ impl Ext2 {
               break;
             }
 
+            // the final directory entry has a size that takes up the rest of the directory
             if new_directory.entry_size as isize + byte_offset >= directory.size_low as isize {
                 let real_size = u16::try_from(4 + 2 + 1 + mem::size_of::<TypeIndicator>() + new_directory.name.as_bytes().len() + 1).unwrap();
                 // inode ptr size + entry size size + name size size + type indicator size + name size + null character
@@ -263,12 +264,14 @@ impl Ext2 {
         new_directory.type_indicator = TypeIndicator::Directory;
         let mut name_iter = new_directory.name.as_bytes_mut().as_mut_ptr();
         let mut name_offset = 0;
+        // perform pointer arithmetic to set each byte of the name to the correct character
         for c in name.as_bytes() {
             unsafe { *name_iter.offset(name_offset) = *c; } 
             name_offset += 1;
         }
+        // add null termination
         unsafe { *name_iter.offset(name_offset) = 0; }
-        // inode ptr size + entry size size + name size size + type indicator size + name size + null character
+        // this is the new final directory entry, so its size must fill the rest of the directory 
         new_directory.entry_size = u16::try_from(directory.size_low).unwrap() - u16::try_from(byte_offset).unwrap();
         Ok(())
     }
@@ -289,11 +292,13 @@ impl fmt::Debug for Inode<> {
     }
 }
 
+// turn a path string into a vector of steps along the path
 fn parse_path(from: &str) -> Vec<&str> {
     from.split('/')
         .collect()
 }
 
+// get the inode number of an inode given the relative path to it
 fn relative_path<'a>(path: &'a str, from: Vec<(usize, &'a NulStr)>, fs: &'a Ext2) -> std::result::Result<usize, &'a str> {
     let mut target: Vec<(usize, &NulStr)> = (from).to_vec();
     let mut target_inode: usize = 2;
@@ -320,6 +325,7 @@ fn relative_path<'a>(path: &'a str, from: Vec<(usize, &'a NulStr)>, fs: &'a Ext2
     Ok(target_inode)
 }
 
+// flush entire file system out
 fn flush(fs: &Ext2, name: String) {
     fs::write(name, fs.start_ptr).unwrap();
 }
@@ -418,7 +424,7 @@ fn main() -> Result<()> {
                 let mut cwd = 0;
                 for dir in dirs {
                   if dir.1.to_string().eq(".") {
-                    cwd = dir.0;
+                    cwd = dir.0; // a directory should have a link to itself under "."
                     break
                   }
                 }
@@ -439,6 +445,7 @@ fn main() -> Result<()> {
                 inode.size_low = 1024 << ext2.superblock.log_block_size;
                 inode.hard_links = 1;
                 inode.direct_pointer[0] = allocated_block as u32;
+                // link self to cwd, link self to self, link cwd to self
                 ext2.link(cwd, inode_number.try_into().unwrap(), name.to_string());
                 ext2.link(inode_number.try_into().unwrap(), inode_number.try_into().unwrap(), ".".to_string());
                 ext2.link(inode_number.try_into().unwrap(), cwd.try_into().unwrap(), "..".to_string());
@@ -457,10 +464,10 @@ fn main() -> Result<()> {
                     };
                     if found_file { 
                         let inode: &Inode = ext2.get_inode(target);
-                        // check if directory flag is set (& DIRECTORY masks out other flags, == DIRECTORY compares flag)
+                        // check if file flag is set (& FILE masks out other flags, == FILE compares flag)
                         if inode.type_perm & structs::TypePerm::FILE == structs::TypePerm::FILE {
                             let mut current_size: usize = 0;
-                            for direct in inode.direct_pointer {
+                            for direct in inode.direct_pointer { // TODO: Add support for large files
                                 if current_size >= inode.size_low.try_into().unwrap() {
                                     break
                                 }
@@ -509,12 +516,12 @@ fn main() -> Result<()> {
                     Err(_) => {println!("Unable to locate {}, mkdir failed", source); 0 },
                 };
 
-
                 let (dest_path, dest_name) = match args[2].rsplit_once("/") {
                   Some(o) => o,
                   None => ("", args[2]),
                 };
                 let mut found_self = false;
+                // if a path is given, follow the path. otherwise, use cwd
                 let dest_dir_inode = match dest_path {
                   "" => {found_self = true; let mut t = 0; for (num, name) in dirs { if name.to_string().eq(".") { t = num; break } }; t },
                   _ => match relative_path(dest_path, dirs.clone(), &ext2) {
