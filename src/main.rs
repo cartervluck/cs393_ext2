@@ -174,20 +174,40 @@ impl Ext2 {
             let which_bit = usize::try_from(i % 8).unwrap();
             // Check if relevant bit is 1 or 0 by ANDing with 1 << which_bit
             if !(inode_bitmap[which_byte] & (1 << which_bit) > 0) {
-                println!("Bitmap before: {}", inode_bitmap[which_byte]);
-                inode_number = i;
+                // println!("Bitmap before: {}", inode_bitmap[which_byte]);
+                inode_number = i+1;
                 inode_bitmap[which_byte] = inode_bitmap[which_byte] | (1 << which_bit);
                 break
             }
         }
         let bm = self.read_dir_block(usize::try_from(self.block_groups[group_i].inode_usage_addr).unwrap()).unwrap();
-        println!("Allocated inode in group {}, bitmap looks like {}", group_i, bm[usize::try_from(inode_number / 8).unwrap()]);
+        // println!("Allocated inode in group {}, bitmap looks like {}", group_i, bm[usize::try_from(inode_number / 8).unwrap()]);
         if inode_number == 0 {
             return Err("Error finding inode.")
         }
         // Recontextualize inode number from within group to global number
         let inode_number = u32::try_from(group_i).unwrap() * self.superblock.inodes_per_group + inode_number;
         Ok(inode_number.try_into().unwrap())
+    }
+
+    pub fn free_inode(&mut self, inode: usize) -> std::result::Result<(),&str> {
+        let which_group = inode / usize::try_from(self.superblock.inodes_per_group).unwrap();
+        let which_inode = inode % usize::try_from(self.superblock.inodes_per_group).unwrap();
+        let mut group = &mut self.block_groups[which_group];
+        group.free_inodes_count += 1;
+        let inode_bitmap_addr = group.inode_usage_addr;
+        let which_byte = usize::try_from(which_inode / 8).unwrap();
+        let which_bit = usize::try_from(which_inode % 8).unwrap();
+        let mut inode_bitmap = self.read_dir_block(usize::try_from(inode_bitmap_addr).unwrap()).unwrap();
+        inode_bitmap[which_byte] = inode_bitmap[which_byte] & (!(1 << which_bit));
+        let mut inode = self.get_inode(inode);
+        for block in inode.direct_pointer {
+            if block == 0 {
+                break
+            }
+            self.free_block(block.try_into().unwrap());
+        }
+        Ok(())
     }
 
     // find free block and allocate it for use
@@ -217,7 +237,7 @@ impl Ext2 {
 
         let final_block = group * (self.superblock.blocks_per_group as usize) + (block_number as usize);
 
-        println!("Allocated block {}", final_block);
+        // println!("Allocated block {}", final_block);
         
         // clean out old data
         let mut block = self.read_dir_block(final_block).unwrap();
@@ -228,10 +248,23 @@ impl Ext2 {
         final_block
     }
 
+    pub fn free_block(&mut self, block: usize) -> std::result::Result<(),&str> {
+        let which_group = block / usize::try_from(self.superblock.blocks_per_group).unwrap();
+        let which_block = block % usize::try_from(self.superblock.blocks_per_group).unwrap();
+        let mut group = &mut self.block_groups[which_group];
+        group.free_blocks_count += 1;
+        let block_bitmap_addr = group.block_usage_addr;
+        let which_byte = usize::try_from(which_block / 8).unwrap();
+        let which_bit = usize::try_from(which_block % 8).unwrap();
+        let mut block_bitmap = self.read_dir_block(usize::try_from(block_bitmap_addr).unwrap()).unwrap();
+        block_bitmap[which_byte] = block_bitmap[which_byte] & (!(1 << which_bit));
+        Ok(())
+    }
+
     // create a hardlink from a directory to an inode
     pub fn link(&self, dir_inode: usize, link_inode: usize, name: String) -> Result<()> {
         let directory = self.get_inode(dir_inode);
-        println!("Linking, my direct pointer is {}", directory.direct_pointer[0]);
+        //println!("Linking, my direct pointer is {}", directory.direct_pointer[0]);
         let entry_ptr = self.blocks[directory.direct_pointer[0] as usize - self.block_offset].as_ptr();
         let mut byte_offset: isize = 0;
         while byte_offset < directory.size_low as isize { // <- todo, support large directories
@@ -259,7 +292,7 @@ impl Ext2 {
         };
         //println!("{:?}",new_directory);
         new_directory.inode = u32::try_from(link_inode).unwrap();
-        println!("Linking from inode {} to inode {}", dir_inode, new_directory.inode);
+        // println!("Linking from inode {} to inode {}", dir_inode, new_directory.inode);
         new_directory.name_length = u8::try_from(name.len()).unwrap();
         new_directory.type_indicator = TypeIndicator::Directory;
         let mut name_iter = new_directory.name.as_bytes_mut().as_mut_ptr();
@@ -273,6 +306,86 @@ impl Ext2 {
         unsafe { *name_iter.offset(name_offset) = 0; }
         // this is the new final directory entry, so its size must fill the rest of the directory 
         new_directory.entry_size = u16::try_from(directory.size_low).unwrap() - u16::try_from(byte_offset).unwrap();
+        
+        let linked = self.get_inode(link_inode);
+        linked.hard_links += 1;
+        Ok(())
+    }
+
+    pub fn unlink(&mut self, dir_inode: usize, name: String) -> std::result::Result<(), &str> {
+        let directory = self.read_dir_inode(dir_inode).unwrap();
+        let mut target_inode = 0;
+        let mut found_target = false;
+        for (i_num, i_name) in directory {
+            if i_name.to_string().eq(&name) {
+                target_inode = i_num;
+                found_target = true;
+                break;
+            }
+        }
+        if !found_target {
+            return Err("No item with that name was found.");
+        }
+
+        //println!("Unlinking inode {}", target_inode);
+
+        let mut removed_size = 0;
+        let mut pivot_byte = 0;
+        let directory_inode = self.get_inode(dir_inode);
+        let entry_ptr = self.blocks[directory_inode.direct_pointer[0] as usize - self.block_offset].as_ptr();
+        let mut byte_offset: isize = 0;
+        while byte_offset < directory_inode.size_low as isize { // <- todo, support large directories
+            if removed_size == 0 {
+                let new_directory = unsafe {
+                    &mut *(entry_ptr.offset(byte_offset) as *mut DirectoryEntry) 
+                };
+            
+                if new_directory.entry_size == 0 {
+                  break;
+                }
+
+                if new_directory.inode == target_inode.try_into().unwrap() {
+                    removed_size = new_directory.entry_size;
+                    pivot_byte = byte_offset;
+                } else {
+                    byte_offset += isize::try_from(new_directory.entry_size).unwrap();
+                }
+            } else {
+                let byte = unsafe {
+                  &mut *(entry_ptr.offset(byte_offset) as *mut u8)
+                };
+
+                let change_to = unsafe {
+                  if byte_offset + isize::try_from(removed_size).unwrap() >= self.block_size.try_into().unwrap() { 0 } else { *(entry_ptr.offset(byte_offset + isize::try_from(removed_size).unwrap()) as *const u8) }
+                };
+
+                *byte = change_to;
+
+                byte_offset += 1;
+            }
+        }
+
+        let mut byte_offset: isize = 0;
+        let mut last_entry = unsafe { &mut *(entry_ptr as *mut DirectoryEntry) };
+        let mut size = last_entry.entry_size;
+        while size != 0 {
+            let new_directory = unsafe {
+                &mut *(entry_ptr.offset(byte_offset) as *mut DirectoryEntry) 
+            };
+            size = new_directory.entry_size;
+            byte_offset += isize::try_from(size).unwrap();
+            if new_directory.entry_size == 0 {
+              break
+            }
+            last_entry = new_directory;
+        }
+        last_entry.entry_size += removed_size;
+        
+        let target = self.get_inode(target_inode.try_into().unwrap());
+        target.hard_links -= 1;
+        if target.hard_links == 0 {
+            self.free_inode(target_inode.try_into().unwrap());
+        }
         Ok(())
     }
 }
@@ -490,7 +603,32 @@ fn main() -> Result<()> {
             } else if line.starts_with("rm") {
                 // `rm target`
                 // unlink a file or empty directory
-                println!("rm not yet implemented");
+                let args = line.split(' ').collect::<Vec<&str>>();
+
+                if args.len() <= 1 {
+                  println!("Command `rm` expected one argument, no arguments given.");
+                  continue
+                }
+                
+                let (path, name) = match args[1].rsplit_once("/") {
+                  Some(o) => o,
+                  None => ("", args[1]),
+                };
+
+                let mut found_self = false;
+                let directory = match path { 
+                    "" => {found_self = true; let mut t = 0; for (num, name) in dirs { if name.to_string().eq(".") { t = num; break } }; t},
+                    p => match relative_path(p, dirs.clone(), &ext2) {
+                        Ok(t) => {found_self = true; t},
+                        Err(_) => {println!("Unable to locate {}, rm failed", args[1]); 0},
+                    },
+                };
+
+                if found_self == false {
+                    continue
+                }
+
+                ext2.unlink(directory, name.to_string());
             } else if line.starts_with("flush") {
                 flush(&ext2, fname.clone());
             } else if line.starts_with("mount") {
@@ -505,8 +643,10 @@ fn main() -> Result<()> {
                 let args = line.split(' ').collect::<Vec<&str>>();
                 if args.len() == 1 {
                   println!("Command `link` expected two arguments, no arguments given.");
+                  continue
                 } else if args.len() == 2 {
                   println!("Command `link` expected two arguments, one argument given.");
+                  continue
                 }
                 
                 let source = args[1];
@@ -515,7 +655,11 @@ fn main() -> Result<()> {
                     Ok(t) => {found_self = true; t},
                     Err(_) => {println!("Unable to locate {}, mkdir failed", source); 0 },
                 };
-
+        
+                if found_self == false {
+                    continue
+                }
+  
                 let (dest_path, dest_name) = match args[2].rsplit_once("/") {
                   Some(o) => o,
                   None => ("", args[2]),
@@ -529,6 +673,10 @@ fn main() -> Result<()> {
                       Err(_) => {println!("Unable to locate {}, mkdir failed", dest_path); 0 },
                   },
                 };
+
+                if found_self == false {
+                  continue
+                }
 
                 ext2.link(dest_dir_inode, source_inode, dest_name.to_string());
             } else if line.starts_with("quit") || line.starts_with("exit") {
