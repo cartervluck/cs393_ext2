@@ -191,6 +191,16 @@ impl Ext2 {
     }
 
     pub fn free_inode(&mut self, inode: usize) -> std::result::Result<(),&str> {
+        // if inode is a directory, unlink everything
+        // problem: if a directory has a child directory, it will point back to its parent at ..
+        // and the parent won't be freed when unused, since child will still point to it
+        if self.get_inode(inode).type_perm & structs::TypePerm::DIRECTORY == structs::TypePerm::DIRECTORY {
+            let directory = self.read_dir_inode(inode);
+            for (i, name) in directory {
+                self.unlink(inode, name);
+            }
+        }
+
         let which_group = inode / usize::try_from(self.superblock.inodes_per_group).unwrap();
         let which_inode = inode % usize::try_from(self.superblock.inodes_per_group).unwrap();
         let mut group = &mut self.block_groups[which_group];
