@@ -198,15 +198,15 @@ impl Ext2 {
             let mut directory = self.read_dir_inode(inode).unwrap().clone();
             let mut children: Vec<String> = vec![];
             for (i, name) in directory {
-                children.push(name.to_string());
+                if !name.to_string().eq(".") { children.push(name.to_string()); }
             }
             for name in children {
                 self.unlink(inode, name);
             }
         }
 
-        let which_group = inode / usize::try_from(self.superblock.inodes_per_group).unwrap();
-        let which_inode = inode % usize::try_from(self.superblock.inodes_per_group).unwrap();
+        let which_group = (inode - 1) / usize::try_from(self.superblock.inodes_per_group).unwrap();
+        let which_inode = (inode - 1) % usize::try_from(self.superblock.inodes_per_group).unwrap();
         let mut group = &mut self.block_groups[which_group];
         group.free_inodes_count += 1;
         let inode_bitmap_addr = group.inode_usage_addr;
@@ -275,8 +275,28 @@ impl Ext2 {
         Ok(())
     }
 
+    pub fn num_directory_children(&self, inode: usize) -> usize {
+        if self.get_inode(inode).type_perm & structs::TypePerm::DIRECTORY != structs::TypePerm::DIRECTORY {
+            return 0;
+        }
+
+        let directory = self.read_dir_inode(inode).unwrap();
+        let mut children: Vec<usize> = vec![];
+        for (i, name) in directory {
+            children.push(i);
+        }
+        let mut num = 0;
+        for i in children {
+            let data = self.get_inode(i);
+            if data.type_perm & structs::TypePerm::DIRECTORY == structs::TypePerm::DIRECTORY {
+                num += 1;
+            }
+        }
+        num
+    }
+
     // create a hardlink from a directory to an inode
-    pub fn link(&self, dir_inode: usize, link_inode: usize, name: String, count_link: bool) -> Result<()> {
+    pub fn link(&self, dir_inode: usize, link_inode: usize, name: String) -> Result<()> {
         let directory = self.get_inode(dir_inode);
         //println!("Linking, my direct pointer is {}", directory.direct_pointer[0]);
         let entry_ptr = self.blocks[directory.direct_pointer[0] as usize - self.block_offset].as_ptr();
@@ -321,10 +341,8 @@ impl Ext2 {
         // this is the new final directory entry, so its size must fill the rest of the directory 
         new_directory.entry_size = u16::try_from(directory.size_low).unwrap() - u16::try_from(byte_offset).unwrap();
         
-        if count_link {
-            let linked = self.get_inode(link_inode);
-            linked.hard_links += 1;
-        }
+        let linked = self.get_inode(link_inode);
+        linked.hard_links += 1;
         Ok(())
     }
 
@@ -398,8 +416,8 @@ impl Ext2 {
         last_entry.entry_size += removed_size;
         
         let target = self.get_inode(target_inode.try_into().unwrap());
-        target.hard_links -= 1;
-        if target.hard_links == 0 {
+        if target.hard_links > 0 { target.hard_links -= 1; }
+        if usize::from(target.hard_links) <= self.num_directory_children(target_inode) && target_inode != 2 {
             self.free_inode(target_inode.try_into().unwrap());
         }
         Ok(())
@@ -572,12 +590,12 @@ fn main() -> Result<()> {
                 let inode: &mut Inode = ext2.get_inode(inode_number.try_into().unwrap());
                 inode.type_perm = structs::TypePerm::DIRECTORY | structs::TypePerm::U_READ;
                 inode.size_low = 1024 << ext2.superblock.log_block_size;
-                inode.hard_links = 1;
+                inode.hard_links = 0;
                 inode.direct_pointer[0] = allocated_block as u32;
                 // link self to cwd, link self to self, link cwd to self
-                ext2.link(cwd, inode_number.try_into().unwrap(), name.to_string(), true);
-                ext2.link(inode_number.try_into().unwrap(), inode_number.try_into().unwrap(), ".".to_string(), false);
-                ext2.link(inode_number.try_into().unwrap(), cwd.try_into().unwrap(), "..".to_string(), false);
+                ext2.link(cwd, inode_number.try_into().unwrap(), name.to_string());
+                ext2.link(inode_number.try_into().unwrap(), inode_number.try_into().unwrap(), ".".to_string());
+                ext2.link(inode_number.try_into().unwrap(), cwd.try_into().unwrap(), "..".to_string());
             } else if line.starts_with("cat") {
                 // `cat filename`
                 // print the contents of filename to stdout
@@ -694,7 +712,7 @@ fn main() -> Result<()> {
                   continue
                 }
 
-                ext2.link(dest_dir_inode, source_inode, dest_name.to_string(), true);
+                ext2.link(dest_dir_inode, source_inode, dest_name.to_string());
             } else if line.starts_with("quit") || line.starts_with("exit") {
                 break;
             }
