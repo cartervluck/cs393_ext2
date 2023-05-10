@@ -190,10 +190,11 @@ impl Ext2 {
         Ok(inode_number.try_into().unwrap())
     }
 
+    // free up an inode that is no longer in use
     pub fn free_inode(&mut self, inode: usize) -> std::result::Result<(),&str> {
         // if inode is a directory, unlink everything
-        // problem: if a directory has a child directory, it will point back to its parent at ..
-        // and the parent won't be freed when unused, since child will still point to it
+        // problem: if a directory is linked to by a descendant,
+        // it will be unreachable but never cleaned up
         if self.get_inode(inode).type_perm & structs::TypePerm::DIRECTORY == structs::TypePerm::DIRECTORY {
             let mut directory = self.read_dir_inode(inode).unwrap().clone();
             let mut children: Vec<String> = vec![];
@@ -215,6 +216,7 @@ impl Ext2 {
         let mut inode_bitmap = self.read_dir_block(usize::try_from(inode_bitmap_addr).unwrap()).unwrap();
         inode_bitmap[which_byte] = inode_bitmap[which_byte] & (!(1 << which_bit));
         let mut inode = self.get_inode(inode);
+        // todo: make this work with large inodes
         for block in inode.direct_pointer {
             if block == 0 {
                 break
@@ -262,6 +264,7 @@ impl Ext2 {
         final_block
     }
 
+    // free up block from deleted file
     pub fn free_block(&mut self, block: usize) -> std::result::Result<(),&str> {
         let which_group = block / usize::try_from(self.superblock.blocks_per_group).unwrap();
         let which_block = block % usize::try_from(self.superblock.blocks_per_group).unwrap();
@@ -275,6 +278,8 @@ impl Ext2 {
         Ok(())
     }
 
+    // number of children a directory has that have a link to it
+    // used to determine if a directory is reachable
     pub fn num_directory_children(&self, inode: usize) -> usize {
         if self.get_inode(inode).type_perm & structs::TypePerm::DIRECTORY != structs::TypePerm::DIRECTORY {
             return 0;
@@ -283,7 +288,8 @@ impl Ext2 {
         let directory = self.read_dir_inode(inode).unwrap();
         let mut children: Vec<usize> = vec![];
         for (i, name) in directory {
-            children.push(i);
+            // don't include parent
+            if !name.to_string().eq("..") { children.push(i); }
         }
         let mut num = 0;
         for i in children {
@@ -326,7 +332,7 @@ impl Ext2 {
         };
         //println!("{:?}",new_directory);
         new_directory.inode = u32::try_from(link_inode).unwrap();
-        // println!("Linking from inode {} to inode {}", dir_inode, new_directory.inode);
+        println!("Linking from inode {} to inode {}", dir_inode, new_directory.inode);
         new_directory.name_length = u8::try_from(name.len()).unwrap();
         new_directory.type_indicator = TypeIndicator::Directory;
         let mut name_iter = new_directory.name.as_bytes_mut().as_mut_ptr();
@@ -346,6 +352,7 @@ impl Ext2 {
         Ok(())
     }
 
+    //remove a hardlink from a directory with name "name" and free inodes if relevant
     pub fn unlink(&mut self, dir_inode: usize, name: String) -> std::result::Result<(), &str> {
         let directory = self.read_dir_inode(dir_inode).unwrap();
         let mut target_inode = 0;
@@ -378,18 +385,19 @@ impl Ext2 {
                   break;
                 }
 
-                if new_directory.inode == target_inode.try_into().unwrap() {
+                if new_directory.inode == target_inode.try_into().unwrap() { // find inode to unlink
                     removed_size = new_directory.entry_size;
                     pivot_byte = byte_offset;
                 } else {
                     byte_offset += isize::try_from(new_directory.entry_size).unwrap();
                 }
-            } else {
+            } else { // for every byte after the unlinked inode, shift left a number of bytes equal to the size of the removed inode
                 let byte = unsafe {
                   &mut *(entry_ptr.offset(byte_offset) as *mut u8)
                 };
 
                 let change_to = unsafe {
+                  // pad the right edge with 0s
                   if byte_offset + isize::try_from(removed_size).unwrap() >= self.block_size.try_into().unwrap() { 0 } else { *(entry_ptr.offset(byte_offset + isize::try_from(removed_size).unwrap()) as *const u8) }
                 };
 
@@ -402,6 +410,7 @@ impl Ext2 {
         let mut byte_offset: isize = 0;
         let mut last_entry = unsafe { &mut *(entry_ptr as *mut DirectoryEntry) };
         let mut size = last_entry.entry_size;
+        // find final element of directory
         while size != 0 {
             let new_directory = unsafe {
                 &mut *(entry_ptr.offset(byte_offset) as *mut DirectoryEntry) 
@@ -413,11 +422,13 @@ impl Ext2 {
             }
             last_entry = new_directory;
         }
+        // we need to add the size back in to the final element so the directory is "full"
         last_entry.entry_size += removed_size;
         
         let target = self.get_inode(target_inode.try_into().unwrap());
         if target.hard_links > 0 { target.hard_links -= 1; }
         if usize::from(target.hard_links) <= self.num_directory_children(target_inode) && target_inode != 2 {
+            // free up inode if it's now unreachable (unless it's the root inode)
             self.free_inode(target_inode.try_into().unwrap());
         }
         Ok(())
