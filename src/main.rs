@@ -655,6 +655,10 @@ fn main() -> Result<()> {
                   continue
                 }
                 
+                if args[1].eq(".") || args[1].eq("..") {
+                    println!("Cannot delete a directory while inside of it.");
+                }
+
                 let (path, name) = match args[1].rsplit_once("/") {
                   Some(o) => o,
                   None => ("", args[1]),
